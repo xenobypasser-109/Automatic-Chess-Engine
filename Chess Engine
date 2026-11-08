@@ -1,0 +1,747 @@
+// ==UserScript==
+// @name         chess.com auto-bot
+// @namespace    p.chessbot
+// @version      21.0
+// @description  elo-biased blundering, time scrambling, anti-detection
+// @match        https://www.chess.com/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+(function () {
+  'use strict';
+  // Skids in chess finna get deducted to steammmm
+  if (window.__PCB__) window.__PCB__.destroy();
+
+  const LOG = (msg, ...args) => console.log('%c[pcb]', 'color:#7fe08a;font-weight:bold', msg, ...args);
+  const ERR = (msg, ...args) => console.error('%c[pcb]', 'color:#ff6b6b;font-weight:bold', msg, ...args);
+
+  const State = { IDLE: 'idle', THINKING: 'thinking', MOVING: 'moving', WAITING: 'waiting' };
+
+  const NET = {
+    moves: [], callbacks: new Set(),
+    emit() { this.callbacks.forEach(cb => { try { cb(); } catch (e) {} }); },
+    subscribe(cb) { this.callbacks.add(cb); return () => this.callbacks.delete(cb); },
+  };
+
+  function handleNetFrame(raw) {
+    let text = raw;
+    if (text instanceof ArrayBuffer) text = new TextDecoder().decode(text);
+    if (typeof text !== 'string') return;
+    text = text.replace(/^\u0000+/, '').trim();
+    if (!text || (text[0] !== '{' && text[0] !== '[')) return;
+    let obj;
+    try { obj = JSON.parse(text); } catch (e) { return; }
+    const nodes = Array.isArray(obj) ? obj : [obj];
+    for (const n of nodes) {
+      if (!n || typeof n !== 'object') continue;
+      if ((n.type === 'move' || n.type === 'userMove') && (n.move || n.userMove)) {
+        const m = n.move || n.userMove;
+        const from = m.from !== undefined ? m.from : m.u;
+        const to = m.to !== undefined ? m.to : m.c;
+        if (from !== undefined && to !== undefined) {
+          NET.moves.push({ from, to, promotion: m.promotion || m.p });
+          NET.emit();
+        }
+      }
+      if (Array.isArray(n.moves)) {
+        NET.moves = n.moves.map(m => ({
+          from: m.from !== undefined ? m.from : m.u,
+          to: m.to !== undefined ? m.to : m.c,
+          promotion: m.promotion || m.p,
+        }));
+        NET.emit();
+      }
+    }
+  }
+
+  const OrigWS = window.WebSocket;
+  function WrappedWS(url, protocols) {
+    const ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
+    try { ws.addEventListener('message', ev => handleNetFrame(ev.data)); } catch (e) {}
+    return ws;
+  }
+  WrappedWS.prototype = OrigWS.prototype;
+  WrappedWS.CONNECTING = OrigWS.CONNECTING;
+  WrappedWS.OPEN = OrigWS.OPEN;
+  WrappedWS.CLOSING = OrigWS.CLOSING;
+  WrappedWS.CLOSED = OrigWS.CLOSED;
+  window.WebSocket = WrappedWS;
+
+  const DOM = {
+    getBoard() { return document.querySelector('wc-chess-board, .board'); },
+    pieceSize(board) { return board.getBoundingClientRect().width / 8; },
+    flipped(board) { return board.classList.contains('flipped'); },
+    pieces(board) {
+      const out = [];
+      const boardRect = board.getBoundingClientRect();
+      const size = this.pieceSize(board);
+      const flipped = this.flipped(board);
+
+      board.querySelectorAll('.piece').forEach(el => {
+        const cls = el.className.split(/\s+/);
+        const pc = cls.find(c => /^[wb][prnbqk]$/.test(c));
+        if (!pc) return;
+
+        let f = -1, r = -1;
+        const sqMatch = cls.find(c => /^square-[1-8][1-8]$/.test(c));
+        if (sqMatch) {
+          const idx = sqMatch.indexOf('-') + 1;
+          f = parseInt(sqMatch[idx], 10) - 1;
+          r = parseInt(sqMatch[idx + 1], 10);
+        } else {
+          const m = (el.style.transform || '').match(/translate(?:3d)?\(\s*(-?\d+(?:\.\d+)?)px(?:\s*,\s*|\s*,\s*)(-?\d+(?:\.\d+)?)px/);
+          if (m) {
+            const sf = Math.round(parseFloat(m[1]) / size);
+            const sr = Math.round(parseFloat(m[2]) / size);
+            f = flipped ? 7 - sf : sf;
+            r = flipped ? sr + 1 : 8 - sr;
+          } else {
+            const rect = el.getBoundingClientRect();
+            const sf = Math.round((rect.left - boardRect.left) / size);
+            const sr = Math.round((rect.top - boardRect.top) / size);
+            f = flipped ? 7 - sf : sf;
+            r = flipped ? sr + 1 : 8 - sr;
+          }
+        }
+        if (f >= 0 && f <= 7 && r >= 1 && r <= 8) out.push({ f, r, color: pc[0], type: pc[1], el });
+      });
+      return out;
+    },
+    fen(pieces, side) {
+      const grid = Array.from({ length: 8 }, () => Array(8).fill(null));
+      for (const p of pieces) grid[8 - p.r][p.f] = p.color === 'w' ? p.type.toUpperCase() : p.type;
+      const rows = grid.map(row => {
+        let s = '', n = 0;
+        for (const c of row) { if (!c) n++; else { if (n) { s += n; n = 0; } s += c; } }
+        if (n) s += n;
+        return s;
+      });
+      const has = (f, r, c, t) => pieces.some(p => p.f === f && p.r === r && p.color === c && p.type === t);
+      let castle = '';
+      if (has(4, 1, 'w', 'k')) { if (has(7, 1, 'w', 'r')) castle += 'K'; if (has(0, 1, 'w', 'r')) castle += 'Q'; }
+      if (has(4, 8, 'b', 'k')) { if (has(7, 8, 'b', 'r')) castle += 'k'; if (has(0, 8, 'b', 'r')) castle += 'q'; }
+      return `${rows.join('/')} ${side} ${castle || '-'} - 0 1`;
+    },
+    sideToMove(board) {
+      const bottom = document.querySelector('.clock-bottom');
+      const top = document.querySelector('.clock-top');
+      if (bottom && top) {
+        const ourSide = this.flipped(board) ? 'b' : 'w';
+        if (bottom.classList.contains('clock-player-turn')) return ourSide;
+        if (top.classList.contains('clock-player-turn')) return ourSide === 'w' ? 'b' : 'w';
+      }
+      if (NET.moves.length) return NET.moves.length % 2 === 0 ? 'w' : 'b';
+      const moves = document.querySelectorAll('.vertical-move-list .node');
+      let count = 0;
+      moves.forEach(n => { if (n.querySelector('.move')) count++; });
+      if (count > 0) return count % 2 === 0 ? 'w' : 'b';
+      return 'w';
+    },
+    fingerprint(board) {
+      return this.pieces(board).map(p => `${p.color}${p.type}${p.f}${p.r}`).sort().join('|');
+    },
+    getClockTime() {
+      const clock = document.querySelector('.clock-bottom .clock-time-monospace');
+      if (!clock) return null;
+      const text = clock.textContent.trim();
+      if (!text) return null;
+      const parts = text.split(':');
+      let sec = 300;
+      if (parts.length === 3) sec = parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseInt(parts[2]);
+      else if (parts.length === 2) sec = parseInt(parts[0]) * 60 + parseInt(parts[1]);
+      else if (parts.length === 1) sec = parseInt(parts[0]);
+      return (isNaN(sec) || sec <= 0) ? null : sec;
+    }
+  };
+
+  function squareCenter(board, f, r) {
+    const size = DOM.pieceSize(board);
+    const flipped = DOM.flipped(board);
+    const rect = board.getBoundingClientRect();
+    const playSize = size * 8;
+    const ox = rect.left + (rect.width - playSize) / 2;
+    const oy = rect.top + (rect.height - playSize) / 2;
+    const sf = flipped ? 7 - f : f;
+    const sr = flipped ? r - 1 : 8 - r;
+    return { x: ox + sf * size + size / 2, y: oy + sr * size + size / 2 };
+  }
+
+  function pev(el, type, x, y, buttons) {
+    el.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, composed: true, view: window, pointerId: 1, pointerType: 'mouse', isPrimary: true, clientX: x, clientY: y, buttons }));
+  }
+  function mev(el, type, x, y, buttons) {
+    el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, buttons }));
+  }
+
+  function findSquareAt(board, f, r) {
+    const target = squareCenter(board, f, r);
+    const size = DOM.pieceSize(board);
+    for (const sq of board.querySelectorAll('.square')) {
+      const rc = sq.getBoundingClientRect();
+      if (Math.abs(rc.left + rc.width / 2 - target.x) < size / 2 && Math.abs(rc.top + rc.height / 2 - target.y) < size / 2) return sq;
+    }
+    return null;
+  }
+
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+
+  async function executeMove(uci) {
+    const board = DOM.getBoard();
+    if (!board) return false;
+    const from = { f: uci.charCodeAt(0) - 97, r: +uci[1] };
+    const to = { f: uci.charCodeAt(2) - 97, r: +uci[3] };
+    const promo = uci[4] || null;
+
+    const before = DOM.fingerprint(board);
+    const pieces = DOM.pieces(board);
+    const fromPiece = pieces.find(p => p.f === from.f && p.r === from.r);
+    if (!fromPiece) return false;
+
+    const c1 = squareCenter(board, from.f, from.r);
+    const c2 = squareCenter(board, to.f, to.r);
+    const toSq = findSquareAt(board, to.f, to.r);
+    const fromSq = findSquareAt(board, from.f, from.r) || fromPiece.el;
+    
+    pev(fromSq, 'pointerdown', c1.x, c1.y, 1);
+    await wait(30);
+    pev(document, 'pointermove', (c1.x + c2.x) / 2, (c1.y + c2.y) / 2, 1);
+    await wait(30);
+    pev(document, 'pointermove', c2.x, c2.y, 1);
+    await wait(30);
+    pev(fromSq, 'pointerup', c2.x, c2.y, 0);
+    await wait(50);
+    if (toSq) { mev(toSq, 'mouseup', c2.x, c2.y, 0); }
+
+    let deadline = Date.now() + 1200;
+    while (Date.now() < deadline) {
+      await wait(50);
+      if (DOM.fingerprint(board) !== before) { if (promo) await handlePromotion(promo); return true; }
+    }
+
+    if (fromSq && toSq) {
+      mev(fromSq, 'mousedown', c1.x, c1.y, 1); mev(fromSq, 'mouseup', c1.x, c1.y, 0);
+      await wait(80);
+      mev(toSq, 'mousedown', c2.x, c2.y, 1); mev(toSq, 'mouseup', c2.x, c2.y, 0);
+    }
+    deadline = Date.now() + 1200;
+    while (Date.now() < deadline) {
+      await wait(50);
+      if (DOM.fingerprint(board) !== before) { if (promo) await handlePromotion(promo); return true; }
+    }
+    return false;
+  }
+
+  async function handlePromotion(type) {
+    await wait(150);
+    const el = document.querySelector(`.promotion-piece[class*="${type}"], .promotion-window .piece.${type}, [class*="promotion"] [class*="${type}"]`);
+    if (el) {
+      const r = el.getBoundingClientRect();
+      mev(el, 'mousedown', r.left + r.width / 2, r.top + r.height / 2, 1);
+      mev(el, 'mouseup', r.left + r.width / 2, r.top + r.height / 2, 0);
+    }
+  }
+
+  async function loadEngine() {
+    const url = 'https://unpkg.com/stockfish.js@10.0.2/stockfish.js';
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const code = await r.text();
+    const blob = new Blob([code], { type: 'application/javascript' });
+    const w = new Worker(URL.createObjectURL(blob));
+    w.postMessage('uci');
+    const ok = await waitForEngineReady(w, 5000);
+    if (!ok) throw new Error('engine timeout');
+    return w;
+  }
+
+  function waitForEngineReady(worker, timeoutMs) {
+    return new Promise(resolve => {
+      let done = false;
+      const onMsg = ev => {
+        const line = typeof ev.data === 'string' ? ev.data : '';
+        if (line === 'uciok') worker.postMessage('isready');
+        else if (line === 'readyok') { done = true; cleanup(); resolve(true); }
+      };
+      const cleanup = () => { worker.removeEventListener('message', onMsg); clearTimeout(t); };
+      const t = setTimeout(() => { if (!done) { cleanup(); resolve(false); } }, timeoutMs);
+      worker.addEventListener('message', onMsg);
+    });
+  }
+
+  class Bot {
+    constructor() {
+      this.engine = null;
+      this.skill = 20;
+      this.movetime = 3000; 
+      this.autoPlay = false;
+      this.eval = { depth: 0, scoreCp: 0, mate: null, pv: [], bestUci: '', pv1_uci: '', pv2_uci: '', pv3_uci: '', pv4_uci: '' };
+      this.subs = new Set();
+      this.overlay = null;
+      this.state = State.IDLE;
+      this.tickTimer = null;
+      this.lastFp = '';
+      this.fpStableTime = 0;
+      this.thinkStartTime = 0;
+      this.ourColor = 'w';
+      this.prevPieces = [];
+      this.lastClassification = '';
+      this.ignoreNextBestmove = false;
+      this.thinkTimeout = null;
+      this.isRematching = false;
+    }
+
+    sub(cb) { this.subs.add(cb); return () => this.subs.delete(cb); }
+    notify() { this.subs.forEach(cb => { try { cb(); } catch (e) {} }); }
+
+    async init() {
+      this.overlay = new Overlay(this);
+      this.overlay.mount();
+      try { this.engine = await loadEngine(); } catch (e) { this.overlay.setStatus('engine failed'); return; }
+      this.engine.onmessage = (ev) => this.onEngine(ev);
+      this.tickTimer = setInterval(() => this.tick(), 300);
+    }
+
+    onEngine(ev) {
+      const line = typeof ev.data === 'string' ? ev.data : '';
+      if (!line) return;
+      
+      if (line.startsWith('info ') && line.includes(' score ')) {
+        const d = line.match(/\bdepth (\d+)\b/);
+        const sc = line.match(/\bscore (cp|mate) (-?\d+)\b/);
+        const pvMatch = line.match(/\bpv ((?:[a-h][1-8][a-h][1-8][qrbn]?\s*)+)/);
+        const multipvMatch = line.match(/\bmultipv (\d+)\b/);
+        const multipv = multipvMatch ? parseInt(multipvMatch[1]) : 1;
+        
+        if (sc) {
+          this.eval.depth = d ? +d[1] : 0;
+          this.eval.scoreCp = sc[1] === 'cp' ? +sc[2] : null;
+          this.eval.mate = sc[1] === 'mate' ? +sc[2] : null;
+          
+          if (pvMatch) {
+            this.eval.pv = pvMatch[1].trim().split(/\s+/);
+            if (multipv === 1) this.eval.pv1_uci = this.eval.pv[0];
+            if (multipv === 2) this.eval.pv2_uci = this.eval.pv[0];
+            if (multipv === 3) this.eval.pv3_uci = this.eval.pv[0];
+            if (multipv === 4) this.eval.pv4_uci = this.eval.pv[0];
+          }
+          this.notify();
+        }
+      } else if (line.startsWith('bestmove')) {
+        if (this.ignoreNextBestmove) {
+          this.ignoreNextBestmove = false;
+          return;
+        }
+        
+        if (this.state !== State.THINKING) return;
+        clearTimeout(this.thinkTimeout);
+        
+        const m = line.match(/bestmove ([a-h][1-8][a-h][1-8][qrbn]?)/);
+        if (!m || m[1] === '(none)') {
+          this.state = State.IDLE;
+          this.notify();
+          return;
+        }
+        
+        let chosenMove = m[1];
+        
+        // elo blunder to make sure we dont get detected ;)
+        if (this.skill < 20 && this.eval.mate === null && Math.random() < 0.15) {
+           const backup = this.eval.pv2_uci || this.eval.pv3_uci;
+           if (backup) {
+             chosenMove = backup;
+             LOG('Elo-Bias: dropped deep tactic for ' + backup);
+           }
+        }
+
+        this.eval.bestUci = chosenMove;
+        this.state = State.MOVING;
+        
+        this.lastClassification = classifyMove(chosenMove, this.prevPieces, this.ourColor, this.eval.scoreCp, this.eval.mate);
+        this.notify();
+
+        const remainingSec = DOM.getClockTime();
+        
+        let targetTime = 2000 + Math.random() * 4000; 
+
+        const moveCount = Math.floor(NET.moves.length / 2);
+
+        if (moveCount < 4) {
+          targetTime = 1000 + Math.random() * 1000; // Opening: 1-2s
+        } else if (moveCount >= 30) {
+          targetTime += 1000; // Endgame: +1s
+        }
+
+        // if queen is taken --> give like 4 seconds to think
+        if (this.eval.scoreCp !== null && Math.abs(this.eval.scoreCp) > 300) {
+           targetTime = 5000 + Math.random() * 4000; // 5-9s
+        }
+
+        if (remainingSec !== null && remainingSec < 30) {
+          targetTime = 1000 + Math.random() * 1000; // Low time: snap
+        }
+
+        const elapsed = Date.now() - this.thinkStartTime;
+        const finalDelay = Math.max(0, targetTime - elapsed);
+
+        setTimeout(() => {
+          if (this.autoPlay) this.playBest();
+          else this.state = State.IDLE;
+        }, finalDelay);
+      }
+    }
+
+    analyze() {
+      const board = DOM.getBoard();
+      if (!board || !this.engine) return;
+      if (this.state === State.THINKING || this.state === State.MOVING) return;
+      
+      const pieces = DOM.pieces(board);
+      if (!pieces.length) return;
+      
+      this.prevPieces = pieces;
+      this.ourColor = DOM.flipped(board) ? 'b' : 'w';
+      
+      const side = DOM.sideToMove(board);
+      const fen = DOM.fen(pieces, side);
+      
+      if (this.state === State.THINKING) this.ignoreNextBestmove = true;
+      
+      this.state = State.THINKING;
+      this.thinkStartTime = Date.now();
+      this.eval = { depth: 0, scoreCp: 0, mate: null, pv: [], bestUci: '', pv1_uci: '', pv2_uci: '', pv3_uci: '', pv4_uci: '' };
+      this.notify();
+      
+      this.engine.postMessage('stop');
+      this.engine.postMessage('setoption name MultiPV value 4');
+      this.engine.postMessage('setoption name Skill Level value ' + this.skill);
+      this.engine.postMessage('position fen ' + fen);
+      this.engine.postMessage('go movetime ' + this.movetime);
+      
+      clearTimeout(this.thinkTimeout);
+      this.thinkTimeout = setTimeout(() => {
+        if (this.state === State.THINKING) {
+          ERR('engine hung, resetting state');
+          this.engine.postMessage('stop');
+          this.state = State.IDLE;
+          this.notify();
+        }
+      }, this.movetime + 5000);
+    }
+
+    async playBest() {
+      if (!this.eval.bestUci) {
+        this.state = State.IDLE;
+        return;
+      }
+      const success = await executeMove(this.eval.bestUci);
+      this.eval.bestUci = '';
+      this.state = State.WAITING;
+      
+      this.fpStableTime = Date.now() + 3000; 
+      
+      if (!success) this.state = State.IDLE; 
+      this.notify();
+    }
+
+    resign() {
+      const resignBtn = document.querySelector('.resign-button, button[data-cy="resign"], .resign, button.resign');
+      if (resignBtn) {
+        LOG('Resigning...');
+        resignBtn.click();
+      } else {
+        LOG('Could not find resign button.');
+      }
+    }
+
+    checkGameOver() {
+      const modal = document.querySelector('.game-over-modal, .modal-game-over, .board-modal-container, .board-modal');
+      if (!modal || this.isRematching) return;
+
+      const btn = modal.querySelector('button[data-cy="rematch"], button[data-cy="new-game"], .rematch-button, .ui_v5-button-primary, button');
+      
+      if (btn && !btn.disabled) {
+        const text = btn.textContent.toLowerCase();
+        if (text.includes('rematch') || text.includes('new game') || btn.hasAttribute('data-cy')) {
+          LOG('Game over detected. Auto-rematching...');
+          this.isRematching = true;
+          btn.click();
+          
+          setTimeout(() => {
+            NET.moves = [];
+            this.lastFp = '';
+            this.state = State.IDLE;
+            this.eval = { depth: 0, scoreCp: 0, mate: null, pv: [], bestUci: '', pv1_uci: '', pv2_uci: '', pv3_uci: '', pv4_uci: '' };
+            this.isRematching = false;
+            this.notify();
+          }, 2500);
+        }
+      }
+    }
+
+    tick() {
+      if (this.autoPlay) {
+        const isGameOver = document.querySelector('.game-over-modal, .modal-game-over, .board-modal-container, .board-modal');
+        if (isGameOver) {
+          this.checkGameOver();
+          return;
+        }
+      }
+
+      if (this.state === State.THINKING || this.state === State.MOVING) return;
+
+      const board = DOM.getBoard();
+      if (!board) return;
+      
+      const fp = DOM.fingerprint(board);
+      if (fp !== this.lastFp) {
+        this.lastFp = fp;
+        this.fpStableTime = Date.now();
+        return; 
+      }
+      
+      if (Date.now() < this.fpStableTime + 500) return; 
+      
+      const side = DOM.sideToMove(board);
+      const ourSide = DOM.flipped(board) ? 'b' : 'w';
+      
+      if (side === ourSide) this.analyze();
+      else this.state = State.WAITING;
+    }
+
+    setElo(elo) {
+      const map = {
+        300: { skill: 0, movetime: 50 },
+        600: { skill: 1, movetime: 100 },
+        800: { skill: 2, movetime: 200 },
+        1000: { skill: 3, movetime: 300 },
+        1200: { skill: 5, movetime: 500 },
+        1400: { skill: 7, movetime: 800 },
+        1600: { skill: 10, movetime: 1200 },
+        1800: { skill: 12, movetime: 1800 },
+        2000: { skill: 15, movetime: 2500 },
+        2200: { skill: 18, movetime: 3500 }, 
+        2500: { skill: 20, movetime: 5000 },
+        MAX: { skill: 20, movetime: 7000 } 
+      };
+      const val = map[elo] || map.MAX;
+      this.skill = val.skill;
+      this.movetime = val.movetime;
+    }
+
+    destroy() {
+      if (this.tickTimer) clearInterval(this.tickTimer);
+      if (this.thinkTimeout) clearTimeout(this.thinkTimeout);
+      if (this.engine) { try { this.engine.terminate(); } catch (e) {} }
+      if (this.overlay) this.overlay.unmount();
+    }
+  }
+
+  function classifyMove(uci, prevPieces, ourColor, evalScore, mateScore) {
+    if (!uci) return 'Best';
+    const book = ['e2e4', 'd2d4', 'g1f3', 'c2c4', 'e7e5', 'd7d5', 'g8f6', 'c7c5'];
+    if (book.includes(uci)) return 'Book';
+    
+    const toF = uci.charCodeAt(2) - 97;
+    const toR = +uci[3];
+    const isCapture = prevPieces.some(p => p.f === toF && p.r === toR && p.color !== ourColor);
+    
+    if (isCapture && (mateScore > 0 || evalScore > 200)) return 'Brilliant';
+    if (mateScore > 0) return 'Best';
+    if (evalScore > 200) return 'Great';
+    if (evalScore > 50) return 'Excellent';
+    if (evalScore > -50) return 'Best';
+    if (evalScore > -150) return 'Good';
+    if (evalScore > -300) return 'Inaccuracy';
+    return 'Mistake';
+  }
+
+  // finish coding section b after i come back
+  class Overlay {
+    constructor(bot) { this.bot = bot; this.host = null; this.sh = null; this.unsub = null; this.isDragging = false; }
+    
+    mount() {
+      this.host = document.createElement('div');
+      this.host.style.cssText = 'position:fixed;top:80px;left:calc(100% - 280px);z-index:2147483647;transition:opacity 0.2s;';
+      this.sh = this.host.attachShadow({ mode: 'open' });
+      this.sh.innerHTML = `
+        <style>
+          @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+          .c {
+            background: rgba(18, 20, 26, 0.85); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 14px; box-shadow: 0 10px 40px rgba(0,0,0,0.6);
+            padding: 16px; width: 250px; color: #e2e8f0; font-family: 'Inter', -apple-system, sans-serif; font-size: 12px; user-select: none;
+          }
+          .header { 
+            display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;
+            cursor: grab; padding-bottom: 6px; border-bottom: 1px solid rgba(255,255,255,0.05);
+          }
+          .header:active { cursor: grabbing; }
+          .title { font-weight: 700; letter-spacing: 0.1em; font-size: 10px; color: #94a3b8; }
+          .dot { width: 8px; height: 8px; border-radius: 50%; background: #64748b; transition: background 0.3s; }
+          .dot.ready { background: #10b981; box-shadow: 0 0 8px #10b981; }
+          .dot.think { background: #f59e0b; box-shadow: 0 0 8px #f59e0b; }
+          .dot.move  { background: #ef4444; box-shadow: 0 0 8px #ef4444; }
+          
+          .eval-row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; margin-top: 6px; }
+          .ev { font-size: 24px; font-weight: 700; color: #f8fafc; font-variant-numeric: tabular-nums; }
+          .pv { font-family: ui-monospace, monospace; font-size: 10px; color: #64748b; max-width: 160px; text-align: right; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+          
+          .badges { display: flex; gap: 6px; margin-bottom: 12px; min-height: 18px; }
+          .badge { padding: 2px 6px; border-radius: 4px; font-weight: 600; font-size: 10px; text-transform: uppercase; display: none; }
+          .badge.on { display: inline-block; }
+          .badge.book { background: #d97706; color: #fff; }
+          .badge.brilliant { background: #06b6d4; color: #fff; }
+          .badge.great { background: #3b82f6; color: #fff; }
+          .badge.excellent { background: #8b5cf6; color: #fff; }
+          .badge.best { background: #10b981; color: #fff; }
+          .badge.good { background: #64748b; color: #fff; }
+          .badge.inaccuracy { background: #eab308; color: #fff; }
+          .badge.mistake { background: #f97316; color: #fff; }
+
+          .row { display: flex; justify-content: space-between; align-items: center; margin: 8px 0; }
+          .lbl { color: #94a3b8; font-weight: 500; }
+          select {
+            background: rgba(255,255,255,0.05); color: #e2e8f0; border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 6px; padding: 4px 8px; font-family: inherit; font-size: 11px; outline: none; cursor: pointer;
+          }
+          select option { background: #0f172a; color: #e2e8f0; }
+          
+          .buttons { display: flex; gap: 6px; margin-top: 14px; }
+          button {
+            background: rgba(255,255,255,0.05); color: #e2e8f0; border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 8px; padding: 8px 0; font-size: 11px; font-weight: 600;
+            cursor: pointer; flex: 1; transition: all 0.2s; font-family: inherit;
+          }
+          button:hover { background: rgba(255,255,255,0.1); }
+          button.on { background: #3b82f6; border-color: #3b82f6; color: #fff; box-shadow: 0 0 12px rgba(59,130,246,0.4); }
+          button.rs { background: rgba(239, 68, 68, 0.1); border-color: rgba(239, 68, 68, 0.2); color: #fca5a5; }
+          button.rs:hover { background: rgba(239, 68, 68, 0.2); }
+          button:active { transform: scale(0.97); }
+          
+          .hint { font-size: 9px; color: #64748b; text-align: center; margin-top: 12px; letter-spacing: 0.05em; }
+        </style>
+        <div class="c">
+          <div class="header" id="drag-header">
+            <span class="title">C-MASTER'S ENGINE</span>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span class="dot" id="dot"></span>
+              <button class="cls" style="flex:0;padding:0 4px;width:auto;background:transparent;border:none;color:#64748b;cursor:pointer;">✕</button>
+            </div>
+          </div>
+          <div class="eval-row">
+            <span class="ev">0.00</span>
+            <span class="pv">—</span>
+          </div>
+          <div class="badges">
+            <span class="badge" id="badge"></span>
+          </div>
+          <div class="row">
+            <span class="lbl">ELO</span>
+            <select class="elo">
+              <option value="300">300</option>
+              <option value="600">600</option>
+              <option value="800">800</option>
+              <option value="1000">1000</option>
+              <option value="1200">1200</option>
+              <option value="1400">1400</option>
+              <option value="1600">1600</option>
+              <option value="1800">1800</option>
+              <option value="2000">2000</option>
+              <option value="2200">2200</option>
+              <option value="2500">2500</option>
+              <option value="MAX" selected>MAX</option>
+            </select>
+          </div>
+          <div class="buttons">
+            <button class="an">Think</button>
+            <button class="ap">Auto</button>
+            <button class="rs">Resign</button>
+          </div>
+          <div class="hint">SHIFT + 1 TO HIDE</div>
+        </div>`;
+        
+      document.documentElement.appendChild(this.host);
+      const $ = s => this.sh.querySelector(s);
+      
+      const header = $('#drag-header');
+      let startX, startY, startLeft, startTop;
+      
+      header.addEventListener('mousedown', (e) => {
+        if (e.target.tagName.toLowerCase() === 'button') return;
+        this.isDragging = true;
+        startX = e.clientX;
+        startY = e.clientY;
+        const rect = this.host.getBoundingClientRect();
+        startLeft = rect.left;
+        startTop = rect.top;
+        this.host.style.left = startLeft + 'px';
+        this.host.style.top = startTop + 'px';
+      });
+
+      document.addEventListener('mousemove', (e) => {
+        if (!this.isDragging) return;
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+        this.host.style.left = (startLeft + dx) + 'px';
+        this.host.style.top = (startTop + dy) + 'px';
+      });
+
+      document.addEventListener('mouseup', () => {
+        this.isDragging = false;
+      });
+
+      $('.elo').addEventListener('change', e => { this.bot.setElo(e.target.value); this.bot.analyze(); });
+      $('.an').addEventListener('click', () => { if (this.bot.state === State.IDLE || this.bot.state === State.WAITING) this.bot.analyze(); });
+      $('.ap').addEventListener('click', e => {
+        this.bot.autoPlay = !this.bot.autoPlay;
+        e.target.classList.toggle('on', this.bot.autoPlay);
+        if (this.bot.autoPlay && (this.bot.state === State.IDLE || this.bot.state === State.WAITING)) this.bot.analyze();
+      });
+      $('.rs').addEventListener('click', () => this.bot.resign());
+      $('.cls').addEventListener('click', () => this.bot.destroy());
+      
+      document.addEventListener('keydown', e => {
+        if (e.shiftKey && e.code === 'Digit1') {
+          this.host.style.display = this.host.style.display === 'none' ? '' : 'none';
+        }
+      });
+
+      this.unsub = this.bot.sub(() => this.render());
+    }
+    
+    render() {
+      const $ = s => this.sh.querySelector(s);
+      const e = this.bot.eval;
+      let score = '0.00';
+      if (e.mate !== null) score = 'M' + e.mate;
+      else if (e.scoreCp !== null) score = (e.scoreCp / 100).toFixed(2);
+      
+      $('.ev').textContent = score;
+      $('.pv').textContent = e.pv && e.pv.length ? e.pv.join(' ') : '—';
+      
+      const dot = $('#dot');
+      dot.className = 'dot';
+      if (this.bot.state === State.THINKING) dot.classList.add('think');
+      else if (this.bot.state === State.MOVING) dot.classList.add('move');
+      else if (this.bot.state === State.IDLE && this.bot.engine) dot.classList.add('ready');
+
+      const badge = $('#badge');
+      if (this.bot.lastClassification) {
+        badge.textContent = this.bot.lastClassification;
+        badge.className = 'badge on ' + this.bot.lastClassification.toLowerCase();
+      } else {
+        badge.className = 'badge';
+      }
+    }
+    
+    unmount() {
+      if (this.host && this.host.parentNode) this.host.parentNode.removeChild(this.host);
+      if (this.unsub) this.unsub();
+    }
+  }
+
+  const bot = new Bot();
+  bot.init();
+  window.__PCB__ = bot;
+})();
